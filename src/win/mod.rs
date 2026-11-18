@@ -228,7 +228,8 @@ fn show_menu(hwnd: HWND) {
 }
 
 fn open_in_notepad(path: &std::path::Path) {
-    let p = HSTRING::from(path.as_os_str());
+    // %APPDATA% 경로에 공백이 있을 수 있으므로 따옴표로 감쌈
+    let p = HSTRING::from(format!("\"{}\"", path.display()));
     unsafe {
         ShellExecuteW(None, w!("open"), w!("notepad.exe"), &p, PCWSTR::null(), SW_SHOWNORMAL);
     }

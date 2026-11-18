@@ -89,9 +89,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     }
                 }
             });
+            // 키 누름은 모두 삼킴: Win 키, Alt+Tab, Alt+F4 등 (Ctrl+Alt+Del 은 OS 가 처리하므로 차단 불가)
+            return LRESULT(1);
         }
-        // Win 키, Alt+Tab, Alt+F4 등 모든 키를 삼킴 (Ctrl+Alt+Del 은 OS 가 처리하므로 차단 불가)
-        return LRESULT(1);
+        // 키 뗌은 통과: 가림 시작 시 누르고 있던 Shift 등이 "눌린 채" 남지 않도록
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
