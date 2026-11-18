@@ -39,8 +39,8 @@
 ### 설치
 
 ```sh
-git clone https://github.com/<owner>/force-stretch.git
-cd force-stretch
+git clone https://github.com/kaifacun/force-streach.git
+cd force-streach
 ./install.sh
 ```
 
