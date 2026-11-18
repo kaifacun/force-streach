@@ -2,10 +2,17 @@
 mod overlay;
 
 use std::cell::RefCell;
-use std::time::SystemTime;
 
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    ANTIALIASED_QUALITY, BLACK_BRUSH, BLACKNESS, CLIP_DEFAULT_PRECIS, CreateBitmap,
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, FF_DONTCARE,
+    FW_NORMAL, GetDC, GetStockObject, NULL_PEN, OUT_DEFAULT_PRECIS, PatBlt, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, WHITENESS,
 };
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -23,7 +30,8 @@ use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, GetSystemMetrics, HICON, ICONINFO,
+    SM_CXSMICON, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HMENU, IDI_APPLICATION,
     LoadIconW, MB_ICONASTERISK, MB_ICONEXCLAMATION, MF_CHECKED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
@@ -35,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::common::config::{self, Config};
-use crate::common::schedule::{Event, Scheduler, fmt_dur_label};
+use crate::common::schedule::{Event, Now, Scheduler, fmt_dur_label};
 use crate::common::{failsafe, log};
 
 //#region 상수 (메시지·메뉴 ID)
@@ -133,6 +141,75 @@ fn set_autostart(enable: bool) {
 //#endregion
 
 //#region 트레이 아이콘
+thread_local! {
+    static TRAY_ICON: std::cell::OnceCell<HICON> = const { std::cell::OnceCell::new() };
+}
+
+/// 전용 아이콘 (한 번 그려서 재사용). 실패하면 기본 앱 아이콘.
+fn tray_icon() -> HICON {
+    TRAY_ICON.with(|c| {
+        *c.get_or_init(|| {
+            draw_icon().unwrap_or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default())
+        })
+    })
+}
+
+/// 코럴색 원 + 흰색 🧘 글리프를 GDI 로 그려 아이콘 생성
+fn draw_icon() -> Option<HICON> {
+    unsafe {
+        let size = GetSystemMetrics(SM_CXSMICON).max(16);
+        let screen = GetDC(None);
+        let color = CreateCompatibleBitmap(screen, size, size);
+        let mask = CreateBitmap(size, size, 1, 1, None);
+        let dc = CreateCompatibleDC(Some(screen));
+
+        //#region 색상 비트맵: 바깥은 검정(마스크와 XOR 시 투명), 안은 원 + 글리프
+        let old = SelectObject(dc, color.into());
+        let _ = PatBlt(dc, 0, 0, size, size, BLACKNESS);
+        let brush = CreateSolidBrush(COLORREF(0x005B6BFF)); // BGR: #FF6B5B
+        let old_brush = SelectObject(dc, brush.into());
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        let _ = Ellipse(dc, 0, 0, size + 1, size + 1);
+        let font = CreateFontW(
+            -(size * 3 / 4), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE.0 as u32,
+            w!("Segoe UI Emoji"),
+        );
+        let old_font = SelectObject(dc, font.into());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF(0x00FFFFFF));
+        let mut text: Vec<u16> = "🧘".encode_utf16().collect();
+        let mut rect = RECT { left: 0, top: 0, right: size, bottom: size };
+        DrawTextW(dc, &mut text, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old_font);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteObject(brush.into());
+        //#endregion
+
+        //#region 마스크: 흰색(1)=투명, 원 안은 검정(0)=불투명
+        SelectObject(dc, mask.into());
+        let _ = PatBlt(dc, 0, 0, size, size, WHITENESS);
+        let old_brush = SelectObject(dc, GetStockObject(BLACK_BRUSH));
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        let _ = Ellipse(dc, 0, 0, size + 1, size + 1);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        //#endregion
+
+        SelectObject(dc, old);
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+
+        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon
+    }
+}
+
 fn tray_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -140,7 +217,7 @@ fn tray_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
         uID: TRAY_UID,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+        hIcon: tray_icon(),
         szTip: to_wide_fixed::<128>(tip),
         ..Default::default()
     }
@@ -180,7 +257,7 @@ fn append(menu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM
 fn show_menu(hwnd: HWND) {
     // 메뉴 표시 중(모달 루프)에는 APP 를 빌려두지 않도록 필요한 값만 복사
     let Some((info, paused, interval, brk)) = with_app(|app| {
-        let st = app.sched.status(SystemTime::now());
+        let st = app.sched.status(Now::now());
         (st.info, app.sched.is_paused(), app.sched.cfg.interval_secs, app.sched.cfg.break_secs)
     }) else {
         return;
@@ -239,7 +316,7 @@ fn on_command(id: usize) {
     match id {
         ID_START => start_break(),
         ID_PAUSE => {
-            with_app(|app| app.sched.toggle_pause(SystemTime::now()));
+            with_app(|app| app.sched.toggle_pause(Now::now()));
         }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
         ID_OPEN_CONFIG => {
@@ -274,7 +351,7 @@ fn update_config(f: impl FnOnce(&mut Config)) {
 
 //#region 매 틱 상태 진행
 fn on_tick() {
-    let now = SystemTime::now();
+    let now = Now::now();
     let event = with_app(|app| {
         let ev = app.sched.tick(now, idle_secs());
         if app.sched.is_breaking() && overlay::typed_matches(&app.sched.cfg.emergency_phrase) {
@@ -315,7 +392,7 @@ fn on_tick() {
     refresh_tray();
 }
 
-fn update_paint(app: &App, now: SystemTime) {
+fn update_paint(app: &App, now: Now) {
     let Some(view) = app.sched.break_view(now) else { return };
     let footer = if app.sched.cfg.emergency_phrase.is_empty() {
         String::new()
@@ -335,7 +412,7 @@ fn update_paint(app: &App, now: SystemTime) {
 
 fn refresh_tray() {
     with_app(|app| {
-        let st = app.sched.status(SystemTime::now());
+        let st = app.sched.status(Now::now());
         // 트레이는 글자를 못 띄우므로 툴팁에 남은 시간 표시 (이모지 제외)
         tray_update(app.hwnd, &format!("Force Stretch · {}", st.info));
     });
@@ -344,7 +421,7 @@ fn refresh_tray() {
 
 //#region 스트레칭 시작/종료
 fn start_break() {
-    let now = SystemTime::now();
+    let now = Now::now();
     with_app(|app| {
         if app.sched.is_breaking() {
             return;
@@ -476,7 +553,7 @@ pub fn run(cfg: Config, test_mode: bool) {
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
-                sched: Scheduler::new(cfg, SystemTime::now()),
+                sched: Scheduler::new(cfg, Now::now()),
                 test_mode,
                 overlays: Vec::new(),
                 displays_dirty: false,

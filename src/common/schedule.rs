@@ -1,14 +1,45 @@
-use std::time::{Duration, SystemTime};
+use std::ops::{Add, AddAssign};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::config::Config;
 use super::tips::TIPS;
+
+//#region 현재 시각 (벽시계 + 단조 시계)
+/// 벽시계(`wall`)는 시계 변경·동기화로 앞뒤로 뛸 수 있으므로
+/// 경과 시간은 단조 시계(`mono`)로 재고, 벽시계는 잠자기 감지·일시정지·표시용으로만 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Now {
+    pub wall: SystemTime,
+    pub mono: Instant,
+}
+
+impl Now {
+    pub fn now() -> Self {
+        Self { wall: SystemTime::now(), mono: Instant::now() }
+    }
+}
+
+impl Add<Duration> for Now {
+    type Output = Now;
+    fn add(self, d: Duration) -> Now {
+        Now { wall: self.wall + d, mono: self.mono + d }
+    }
+}
+
+impl AddAssign<Duration> for Now {
+    fn add_assign(&mut self, d: Duration) {
+        *self = *self + d;
+    }
+}
+//#endregion
 
 //#region 상태·이벤트 정의
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Phase {
     Working,
     Paused { until: SystemTime },
-    Breaking { started: SystemTime, ends_at: SystemTime },
+    /// 스트레칭 시간은 단조 시계로 잼 (시계가 뛰어도 일찍 끝나지 않음)
+    Breaking { started: Instant, ends_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +75,10 @@ pub fn secs_between(a: SystemTime, b: SystemTime) -> f64 {
     b.duration_since(a).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+pub fn mono_secs_between(a: Instant, b: Instant) -> f64 {
+    b.saturating_duration_since(a).as_secs_f64()
+}
+
 pub fn fmt_mmss(secs: f64) -> String {
     let s = secs.max(0.0).ceil() as u64;
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -60,23 +95,24 @@ pub struct Scheduler {
     pub phase: Phase,
     /// 현재 주기에서 실제로 작업한 누적 초
     pub work_elapsed: f64,
-    last_tick: SystemTime,
+    last_tick: Now,
     tip_offset: usize,
 }
 
 impl Scheduler {
-    pub fn new(cfg: Config, now: SystemTime) -> Self {
+    pub fn new(cfg: Config, now: Now) -> Self {
         Self { cfg, phase: Phase::Working, work_elapsed: 0.0, last_tick: now, tip_offset: 0 }
     }
 
     /// 주기적으로 호출. `idle_secs` 는 마지막 키보드·마우스 입력 이후 경과 초.
-    pub fn tick(&mut self, now: SystemTime, idle_secs: f64) -> Event {
-        let dt = secs_between(self.last_tick, now);
+    pub fn tick(&mut self, now: Now, idle_secs: f64) -> Event {
+        let wall_dt = secs_between(self.last_tick.wall, now.wall);
+        let dt = mono_secs_between(self.last_tick.mono, now.mono);
         self.last_tick = now;
 
         match self.phase {
             Phase::Paused { until } => {
-                if now >= until {
+                if now.wall >= until {
                     self.phase = Phase::Working;
                     self.work_elapsed = 0.0;
                 }
@@ -84,7 +120,8 @@ impl Scheduler {
             }
             Phase::Working => {
                 let idle_limit = self.cfg.idle_reset_secs.max(self.cfg.break_secs) as f64;
-                if dt > SLEEP_GAP_SECS {
+                // macOS 단조 시계는 잠자기 동안 멈추므로 벽시계 간격도 함께 봄
+                if dt.max(wall_dt) > SLEEP_GAP_SECS {
                     // 잠자기에서 깨어남
                     self.work_elapsed = 0.0;
                 } else if self.cfg.idle_reset && idle_secs >= idle_limit {
@@ -100,7 +137,7 @@ impl Scheduler {
                 }
             }
             Phase::Breaking { ends_at, .. } => {
-                if now >= ends_at { Event::EndBreak } else { Event::None }
+                if now.mono >= ends_at { Event::EndBreak } else { Event::None }
             }
         }
     }
@@ -113,11 +150,12 @@ impl Scheduler {
         matches!(self.phase, Phase::Paused { .. })
     }
 
-    /// 스트레칭 시작. 종료 예정 시각 반환.
-    pub fn start_break(&mut self, now: SystemTime) -> SystemTime {
-        let ends_at = now + Duration::from_secs(self.cfg.break_secs);
-        self.phase = Phase::Breaking { started: now, ends_at };
+    /// 스트레칭 시작. 종료 예정 시각(단조 시계) 반환.
+    pub fn start_break(&mut self, now: Now) -> Instant {
+        let ends_at = now.mono + Duration::from_secs(self.cfg.break_secs);
+        self.phase = Phase::Breaking { started: now.mono, ends_at };
         self.tip_offset = now
+            .wall
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as usize)
             .unwrap_or(0)
@@ -131,14 +169,14 @@ impl Scheduler {
     }
 
     /// 일시정지(1시간) ↔ 재개
-    pub fn toggle_pause(&mut self, now: SystemTime) {
+    pub fn toggle_pause(&mut self, now: Now) {
         self.phase = match self.phase {
             Phase::Paused { .. } => {
                 self.work_elapsed = 0.0;
                 Phase::Working
             }
             Phase::Breaking { .. } => return,
-            Phase::Working => Phase::Paused { until: now + Duration::from_secs(3600) },
+            Phase::Working => Phase::Paused { until: now.wall + Duration::from_secs(3600) },
         };
     }
 
@@ -150,7 +188,7 @@ impl Scheduler {
         self.cfg = cfg;
     }
 
-    pub fn status(&self, now: SystemTime) -> Status {
+    pub fn status(&self, now: Now) -> Status {
         match self.phase {
             Phase::Working => {
                 let left = self.cfg.interval_secs as f64 - self.work_elapsed;
@@ -161,26 +199,26 @@ impl Scheduler {
                 }
             }
             Phase::Paused { until } => {
-                let left = secs_between(now, until);
+                let left = secs_between(now.wall, until);
                 Status {
                     title: format!("⏸ {}", fmt_mmss(left)),
                     info: format!("일시정지 중 · {} 후 재개", fmt_mmss(left)),
                 }
             }
             Phase::Breaking { ends_at, .. } => {
-                let left = secs_between(now, ends_at);
+                let left = mono_secs_between(now.mono, ends_at);
                 Status { title: format!("🤸 {}", fmt_mmss(left)), info: "스트레칭 중".to_string() }
             }
         }
     }
 
-    pub fn break_view(&self, now: SystemTime) -> Option<BreakView> {
+    pub fn break_view(&self, now: Now) -> Option<BreakView> {
         let Phase::Breaking { started, ends_at } = self.phase else {
             return None;
         };
-        let elapsed = secs_between(started, now);
+        let elapsed = mono_secs_between(started, now.mono);
         let idx = (self.tip_offset + (elapsed / 20.0) as usize) % TIPS.len();
-        Some(BreakView { countdown: fmt_mmss(secs_between(now, ends_at)), tip: TIPS[idx] })
+        Some(BreakView { countdown: fmt_mmss(mono_secs_between(now.mono, ends_at)), tip: TIPS[idx] })
     }
 }
 //#endregion
@@ -201,12 +239,16 @@ mod tests {
         }
     }
 
-    fn t0() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+    fn t0() -> Now {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        Now {
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+            mono: *BASE.get_or_init(Instant::now),
+        }
     }
 
     /// 1초 간격으로 n번 틱. 마지막 이벤트 반환.
-    fn run(s: &mut Scheduler, start: SystemTime, n: u64, idle: f64) -> (SystemTime, Event) {
+    fn run(s: &mut Scheduler, start: Now, n: u64, idle: f64) -> (Now, Event) {
         let mut ev = Event::None;
         let mut now = start;
         for _ in 0..n {
@@ -232,7 +274,7 @@ mod tests {
     fn break_ends_after_duration() {
         let mut s = Scheduler::new(cfg(), t0());
         let ends = s.start_break(t0());
-        assert_eq!(ends, t0() + Duration::from_secs(60));
+        assert_eq!(ends, (t0() + Duration::from_secs(60)).mono);
         assert_eq!(s.tick(t0() + Duration::from_secs(59), 0.0), Event::None);
         assert_eq!(s.tick(t0() + Duration::from_secs(60), 0.0), Event::EndBreak);
         s.end_break();
@@ -270,6 +312,36 @@ mod tests {
         let mut s = Scheduler::new(cfg(), t0());
         let (now, _) = run(&mut s, t0(), 100, 0.0);
         s.tick(now + Duration::from_secs(31), 0.0);
+        assert_eq!(s.work_elapsed, 0.0);
+    }
+
+    #[test]
+    fn wall_clock_jump_does_not_end_break_early() {
+        // 시간 동기화로 벽시계만 10분 앞으로 뛰어도 스트레칭은 단조 시계 기준으로 유지
+        let mut s = Scheduler::new(cfg(), t0());
+        s.start_break(t0());
+        let jumped = Now { wall: t0().wall + Duration::from_secs(600), mono: t0().mono + Duration::from_secs(1) };
+        assert_eq!(s.tick(jumped, 0.0), Event::None);
+        assert!(s.is_breaking());
+        assert_eq!(s.break_view(jumped).unwrap().countdown, "00:59");
+    }
+
+    #[test]
+    fn wall_clock_jump_back_keeps_counting() {
+        // 벽시계가 뒤로 가도 작업 시간은 계속 누적
+        let mut s = Scheduler::new(cfg(), t0());
+        let back = Now { wall: t0().wall - Duration::from_secs(3600), mono: t0().mono + Duration::from_secs(1) };
+        s.tick(back, 0.0);
+        assert!((s.work_elapsed - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mac_style_sleep_resets() {
+        // macOS: 잠자기 동안 단조 시계는 멈추고 벽시계만 흐름
+        let mut s = Scheduler::new(cfg(), t0());
+        let (now, _) = run(&mut s, t0(), 100, 0.0);
+        let woke = Now { wall: now.wall + Duration::from_secs(3600), mono: now.mono + Duration::from_secs(1) };
+        s.tick(woke, 0.0);
         assert_eq!(s.work_elapsed, 0.0);
     }
 

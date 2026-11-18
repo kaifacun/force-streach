@@ -11,11 +11,12 @@ use windows::Win32::Graphics::Gdi::{
     SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_SPACE,
+    SetFocus, VK_BACK, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, HC_ACTION,
+    BringWindowToTop, CallNextHookEx, CreateWindowExW, GetForegroundWindow, GetWindowThreadProcessId, DefWindowProcW, DestroyWindow, GetClientRect, HC_ACTION,
     HHOOK, HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LoadCursorW, RegisterClassW,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, SetWindowsHookExW,
     ShowWindow, SW_SHOWNA, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_CLOSE, WM_ERASEBKGND,
@@ -282,7 +283,7 @@ pub fn build_all() -> Vec<HWND> {
         .collect()
 }
 
-/// 매 틱 최상위 재지정 + 첫 창을 전면으로 시도 (실패해도 훅이 키를 막으므로 무방)
+/// 매 틱 최상위 재지정 + 첫 창을 전면으로 (키 입력은 훅이 막지만, 초점까지 가져와야 확실함)
 pub fn keep_on_top(windows: &[HWND]) {
     for &hwnd in windows {
         unsafe {
@@ -294,11 +295,31 @@ pub fn keep_on_top(windows: &[HWND]) {
         }
     }
     if let Some(&first) = windows.first() {
-        unsafe {
-            let _ = SetForegroundWindow(first);
+        force_foreground(first, windows);
+    }
+}
+
+//#region 전면 창 강제 전환
+/// 윈도우는 백그라운드 프로세스의 SetForegroundWindow 를 막으므로(포그라운드 잠금),
+/// 현재 전면 창의 입력 스레드에 잠시 붙어서 권한을 빌린 뒤 전환한다.
+fn force_foreground(target: HWND, ours: &[HWND]) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if ours.contains(&fg) {
+            return;
+        }
+        let me = GetCurrentThreadId();
+        let fg_thread = if fg.is_invalid() { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
+        let _ = BringWindowToTop(target);
+        let _ = SetForegroundWindow(target);
+        let _ = SetFocus(Some(target));
+        if attached {
+            let _ = AttachThreadInput(me, fg_thread, false);
         }
     }
 }
+//#endregion
 
 pub fn invalidate(windows: &[HWND]) {
     for &hwnd in windows {

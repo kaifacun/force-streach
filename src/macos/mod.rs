@@ -4,7 +4,7 @@ mod settings;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::panic::AssertUnwindSafe;
-use std::time::SystemTime;
+use crate::common::schedule::Now;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -98,7 +98,7 @@ define_class!(
 
         #[unsafe(method(togglePause:))]
         fn toggle_pause(&self, _sender: &NSMenuItem) {
-            self.ivars().inner.borrow_mut().sched.toggle_pause(SystemTime::now());
+            self.ivars().inner.borrow_mut().sched.toggle_pause(Now::now());
             self.refresh_menu();
         }
 
@@ -148,7 +148,7 @@ impl AppDelegate {
     fn new(mtm: MainThreadMarker, cfg: Config, test_mode: bool) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(Inner {
-                sched: Scheduler::new(cfg, SystemTime::now()),
+                sched: Scheduler::new(cfg, Now::now()),
                 test_mode,
                 overlays: Vec::new(),
             }),
@@ -268,7 +268,7 @@ impl AppDelegate {
 
     //#region 매 틱 상태 진행
     fn on_tick(&self) {
-        let now = SystemTime::now();
+        let now = Now::now();
         let event = {
             let mut inner = self.ivars().inner.borrow_mut();
             let ev = inner.sched.tick(now, idle_secs());
@@ -310,7 +310,7 @@ impl AppDelegate {
             return;
         }
         let mtm = self.mtm();
-        let now = SystemTime::now();
+        let now = Now::now();
         let ends_at = self.ivars().inner.borrow_mut().sched.start_break(now);
         failsafe::arm(ends_at);
         overlay::clear_typed();
@@ -411,7 +411,7 @@ impl AppDelegate {
         }
     }
 
-    fn update_overlays(&self, now: SystemTime) {
+    fn update_overlays(&self, now: Now) {
         let inner = self.ivars().inner.borrow();
         let Some(view) = inner.sched.break_view(now) else {
             return;
@@ -485,7 +485,7 @@ impl AppDelegate {
     //#region 메뉴바 표시 갱신
     fn update_status_title(&self) {
         let iv = self.ivars();
-        let status = iv.inner.borrow().sched.status(SystemTime::now());
+        let status = iv.inner.borrow().sched.status(Now::now());
         if let Some(item) = iv.status_item.get() {
             if let Some(button) = item.button(self.mtm()) {
                 button.setTitle(&NSString::from_str(&status.title));
