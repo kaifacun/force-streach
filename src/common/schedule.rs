@@ -22,7 +22,8 @@ pub enum Event {
 
 /// 메뉴바/트레이에 표시할 상태
 pub struct Status {
-    /// 짧은 표시 (예: "🧘 23:41")
+    /// 짧은 표시 (예: "🧘 23:41"). Windows 트레이는 글자를 띄울 수 없어 미사용.
+    #[cfg_attr(windows, allow(dead_code))]
     pub title: String,
     /// 긴 설명 (예: "다음 스트레칭까지 23:41")
     pub info: String,

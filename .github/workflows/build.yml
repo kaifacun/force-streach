@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/force-stretch.exe dist/force-stretch.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: force-stretch-windows
+          path: dist/force-stretch.exe
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/force-stretch.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --release
+      - name: Build app bundle
+        run: ./bundle.sh
+      - name: Package
+        run: |
+          mkdir -p dist
+          cd target
+          ditto -c -k --keepParent "Force Stretch.app" ../dist/Force-Stretch-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: force-stretch-macos
+          path: dist/Force-Stretch-macos.zip
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Force-Stretch-macos.zip
