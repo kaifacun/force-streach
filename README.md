@@ -193,3 +193,7 @@ GitHub Actions(`.github/workflows/build.yml`)가 push마다 macOS·Windows에서
 - 의지가 있다면 우회할 수 있습니다 (강제 종료, 비상 해제 문구, 다른 기기에서 원격 종료 등). 이 앱의 목적은 "일어나는 것이 가장 편한 선택"이 되게 만드는 것입니다.
 - 앱 아이콘은 아직 없습니다 (Windows 트레이는 기본 아이콘 사용).
 - CI에서 만드는 macOS 빌드는 Apple Silicon 전용이며 서명·공증되지 않았습니다. 받은 앱이 열리지 않으면 우클릭 → 열기를 사용하세요.
+
+## 라이선스
+
+[MIT](LICENSE)
