@@ -8,6 +8,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
+use crate::common::phrase::PhraseBuffer;
+
 //#region CoreGraphics FFI (최상위 창 레벨)
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -17,15 +19,12 @@ unsafe extern "C" {
 
 //#region 키 입력 버퍼 (비상 해제 문구 감지용)
 thread_local! {
-    static TYPED: RefCell<String> = const { RefCell::new(String::new()) };
+    static TYPED: RefCell<PhraseBuffer> = const { RefCell::new(PhraseBuffer::new()) };
 }
 
 /// 지금까지 입력된 문자열이 비상 문구로 끝나는지 확인
 pub fn typed_matches(phrase: &str) -> bool {
-    if phrase.is_empty() {
-        return false;
-    }
-    TYPED.with(|t| t.borrow().ends_with(phrase))
+    TYPED.with(|t| t.borrow().matches(phrase))
 }
 
 pub fn clear_typed() {
@@ -34,7 +33,7 @@ pub fn clear_typed() {
 
 /// 현재까지 입력 길이 (화면에 진행 표시용)
 pub fn typed_len() -> usize {
-    TYPED.with(|t| t.borrow().chars().count())
+    TYPED.with(|t| t.borrow().len())
 }
 //#endregion
 
@@ -73,21 +72,14 @@ define_class!(
         fn key_down(&self, event: &NSEvent) {
             // 한글 입력 상태여도 같은 물리 키면 같은 영문자로 인식되도록 keyCode 로 해석
             let code = event.keyCode();
-            {
-                TYPED.with(|t| {
-                    let mut t = t.borrow_mut();
-                    if code == 51 {
-                        t.pop();
-                    } else if let Some(c) = keycode_to_char(code) {
-                        t.push(c);
-                    }
-                    // 무한히 커지지 않도록 뒤쪽만 유지
-                    if t.chars().count() > 200 {
-                        let tail: String = t.chars().rev().take(100).collect::<Vec<_>>().into_iter().rev().collect();
-                        *t = tail;
-                    }
-                });
-            }
+            TYPED.with(|t| {
+                let mut t = t.borrow_mut();
+                if code == 51 {
+                    t.backspace();
+                } else if let Some(c) = keycode_to_char(code) {
+                    t.push(c);
+                }
+            });
         }
 
         // 단축키(Cmd+Q, Cmd+W 등)를 삼켜서 아무 일도 일어나지 않게 함
@@ -223,21 +215,4 @@ pub fn build_all(mtm: MainThreadMarker) -> Vec<Overlay> {
         .map(|screen| Overlay::new(&screen, mtm))
         .collect()
 }
-//#endregion
-
-//#region 스트레칭 동작 안내 문구
-pub const TIPS: &[&str] = &[
-    "자리에서 일어나 양팔을 머리 위로 쭉 뻗고 10초 버티세요",
-    "목을 천천히 좌우로 기울여 각 15초씩 늘려주세요",
-    "어깨를 귀까지 올렸다가 툭 떨어뜨리기 — 10회",
-    "손바닥을 앞으로 뻗고 반대 손으로 손가락을 몸쪽으로 당기세요 (손목)",
-    "양손을 허리에 대고 상체를 뒤로 천천히 젖혀주세요",
-    "깍지를 등 뒤에서 끼고 가슴을 활짝 열어주세요",
-    "한쪽 팔을 머리 위로 넘겨 옆구리를 늘려주세요 — 좌우 각 15초",
-    "벽을 짚고 한 발을 뒤로 빼서 종아리를 늘려주세요",
-    "창밖 6m 이상 먼 곳을 20초 이상 바라보세요 (눈 휴식)",
-    "제자리 걷기 30초 — 혈액순환을 깨워주세요",
-    "턱을 뒤로 당겨 이중턱 만들기 — 거북목 교정 10회",
-    "의자 없이 스쿼트 10회!",
-];
 //#endregion

@@ -7,7 +7,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
-use crate::config::Config;
+use crate::common::config::Config;
 
 //#region 설정 창 구성 요소
 pub struct SettingsWindow {

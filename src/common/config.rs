@@ -34,11 +34,22 @@ impl Default for Config {
 //#endregion
 
 //#region 설정 파일 입출력
+/// 설정·로그 파일을 두는 폴더 (OS별)
+pub fn data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join("Library/Application Support/force-stretch")
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+        PathBuf::from(base).join("force-stretch")
+    }
+}
+
 pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join("Library/Application Support/force-stretch")
-        .join("config.toml")
+    data_dir().join("config.toml")
 }
 
 impl Config {
@@ -74,6 +85,17 @@ impl Config {
     }
 
     /// 비정상 값 보정 (0초 주기 등으로 화면이 계속 가려지는 사고 방지)
+    /// 시험 모드: 5초 뒤 8초간 가림, 설정 파일은 저장하지 않음
+    pub fn test_mode() -> Self {
+        Config {
+            interval_secs: 5,
+            break_secs: 8,
+            warn_secs: 3,
+            idle_reset: false,
+            ..Config::load()
+        }
+    }
+
     fn sanitized(mut self) -> Self {
         self.interval_secs = self.interval_secs.clamp(60, 24 * 3600);
         self.break_secs = self.break_secs.clamp(10, 30 * 60);
