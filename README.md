@@ -9,7 +9,7 @@
 | 플랫폼 | 상태 |
 | --- | --- |
 | macOS | 실사용 검증 완료 (다중 모니터, 전체화면 앱, 비상 해제) |
-| Windows | **실험적** — 컴파일만 확인했고 실제 PC에서는 아직 검증되지 않았습니다. [Windows 시험 체크리스트](#windows-시험-체크리스트)를 참고해 주세요. |
+| Windows | **베타** — Windows 11 가상 머신에서 가림 화면·작업 표시줄 가림·주기 정확도를 확인했습니다. 실제 PC·다중 모니터는 아직입니다. [Windows 시험 체크리스트](#windows-시험-체크리스트)를 참고해 주세요. |
 
 ## 기능
 
@@ -85,7 +85,7 @@ cd force-streach
 open -n -W "target/Force Stretch.app" --args --test
 ```
 
-## Windows (실험적)
+## Windows (베타)
 
 ### 받기
 
@@ -126,11 +126,12 @@ open -n -W "target/Force Stretch.app" --args --test
 
 ### Windows 시험 체크리스트
 
-실제 Windows PC에서 아직 검증되지 않았습니다. 시험해 보시고 결과와 함께 로그 파일(`%APPDATA%\force-stretch\force-stretch.log`)을 이슈로 남겨 주시면 큰 도움이 됩니다. `--test` 실행 중에는 로그에 `진단:` 줄이 기록됩니다.
+Windows 11 가상 머신(ARM64에서 x64 에뮬레이션)에서 일부 항목을 확인했습니다. 시험해 보시고 결과와 함께 로그 파일(`%APPDATA%\force-stretch\force-stretch.log`)을 이슈로 남겨 주시면 큰 도움이 됩니다. `--test` 실행 중에는 로그에 `진단:` 줄이 기록됩니다.
 
-- [ ] 트레이 아이콘이 보이고, 클릭하면 메뉴가 열린다
+- [ ] 트레이 아이콘이 보이고, 클릭하면 메뉴가 열린다 (Windows 11은 새 아이콘을 `^` 안에 숨김)
 - [ ] `--test` 실행 시 모든 모니터가 가려진다 (배율이 다른 모니터 포함)
-- [ ] 작업 표시줄까지 가려진다
+- [x] 작업 표시줄까지 가려진다
+- [x] 정해진 주기에 시작하고 정해진 시간 뒤에 끝난다 (시스템 시계가 바뀌어도 단조 시계 기준)
 - [ ] 가림 중 `Alt+Tab`, `Win` 키, `Alt+F4`가 동작하지 않는다
 - [ ] 한글 입력 상태에서도 비상 해제 문구를 타이핑하면 풀린다
 - [ ] 스트레칭이 끝나면 키보드가 정상으로 돌아온다
@@ -188,10 +189,16 @@ cargo check --target x86_64-pc-windows-msvc        # macOS에서 Windows 코드 
 
 GitHub Actions(`.github/workflows/build.yml`)가 push마다 macOS·Windows에서 테스트와 빌드를 수행하고, `v*` 태그를 push하면 Releases에 `force-stretch.exe`와 `Force-Stretch-macos.zip`을 올립니다.
 
+## 버전 관리
+
+- 버전은 `Cargo.toml`의 `version` 한 곳에서만 관리합니다. macOS 앱 번들 버전도 여기서 읽습니다.
+- 변경 내역은 [CHANGELOG.md](CHANGELOG.md)에 기록합니다.
+- 릴리스: `Cargo.toml` 버전을 올리고 CHANGELOG에 항목을 추가한 뒤 `git tag v<버전> && git push origin v<버전>`. CI가 태그와 `Cargo.toml` 버전이 같은지 확인하고, CHANGELOG 해당 항목을 릴리스 노트로 씁니다.
+
 ## 한계
 
 - 의지가 있다면 우회할 수 있습니다 (강제 종료, 비상 해제 문구, 다른 기기에서 원격 종료 등). 이 앱의 목적은 "일어나는 것이 가장 편한 선택"이 되게 만드는 것입니다.
-- 앱 아이콘은 아직 없습니다 (Windows 트레이는 기본 아이콘 사용).
+- 앱 아이콘(실행 파일·앱 번들)은 아직 없습니다. Windows 트레이 아이콘은 실행 중에 그려서 씁니다.
 - CI에서 만드는 macOS 빌드는 Apple Silicon 전용이며 서명·공증되지 않았습니다. 받은 앱이 열리지 않으면 우클릭 → 열기를 사용하세요.
 
 ## 라이선스
