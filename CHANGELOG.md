@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
+### 추가
+- 자동 업데이트: 6시간마다 새 버전을 확인하고, 메뉴에서 누르면 받아서 교체한 뒤 다시 실행 (macOS, Windows). 명령줄 `--update-now`
+- macOS: 메뉴에서 "로그인 시 자동 실행" 켜고 끄기
+- 중복 실행 방지를 macOS에도 적용 (파일 잠금)
+
+### 수정
+- macOS 설정 창에서 자리 비움 체크박스 문구가 잘리던 문제
+- README: macOS 15 이상에서 받은 앱을 여는 방법(개인정보 보호 및 보안 → Open Anyway)
+
 ## [0.1.0] - 2026-11-19
 
 첫 공개 릴리스입니다.
@@ -20,5 +31,6 @@
 - macOS: 모니터 3대, 전체화면 앱, 비상 해제 실사용 확인
 - Windows 11 (VMware, ARM64에서 x64 에뮬레이션): 가림 화면·작업 표시줄 가림, 주기·스트레칭 시간 정확도 확인
 
-[Unreleased]: https://github.com/kaifacun/force-streach/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kaifacun/force-streach/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kaifacun/force-streach/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kaifacun/force-streach/releases/tag/v0.1.0

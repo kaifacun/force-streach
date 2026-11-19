@@ -7,7 +7,8 @@ APP_DST="/Applications/Force Stretch.app"
 PL="$HOME/Library/LaunchAgents/local.force-stretch.plist"
 UID_NUM=$(id -u)
 
-[[ -d "$APP_SRC" ]] || ./bundle.sh
+# 항상 현재 소스로 다시 빌드 (예전 번들이 남아 있어도 덮어씀)
+./bundle.sh
 
 # 실행 중인 인스턴스/기존 등록 정리
 launchctl bootout "gui/$UID_NUM/local.force-stretch" 2>/dev/null || true

@@ -1,6 +1,8 @@
 //! macOS 구현: 메뉴바 상주 + AppKit 전체 화면 가림 창
+mod login;
 mod overlay;
 mod settings;
+pub mod update;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::panic::AssertUnwindSafe;
@@ -22,6 +24,7 @@ use objc2_foundation::{
 
 use crate::common::config::{self, Config};
 use crate::common::schedule::{Event, Scheduler, fmt_dur_label};
+use crate::common::update::{self as upd, Updater};
 use crate::common::{failsafe, log};
 use overlay::Overlay;
 use settings::SettingsWindow;
@@ -44,6 +47,9 @@ struct Inner {
     sched: Scheduler,
     test_mode: bool,
     overlays: Vec<Overlay>,
+    updater: Updater,
+    /// 사용자가 설치를 눌렀음 (실패하면 릴리스 페이지를 열어 수동 설치 안내)
+    install_requested: bool,
 }
 
 struct Ivars {
@@ -55,6 +61,8 @@ struct Ivars {
     pause_item: OnceCell<Retained<NSMenuItem>>,
     interval_menu: OnceCell<Retained<NSMenu>>,
     break_menu: OnceCell<Retained<NSMenu>>,
+    login_item: OnceCell<Retained<NSMenuItem>>,
+    update_item: OnceCell<Retained<NSMenuItem>>,
     settings: RefCell<Option<SettingsWindow>>,
 }
 //#endregion
@@ -136,6 +144,17 @@ define_class!(
             NSWorkspace::sharedWorkspace().openURL(&url);
         }
 
+        #[unsafe(method(toggleLogin:))]
+        fn toggle_login(&self, _sender: &NSMenuItem) {
+            login::set_enabled(!login::is_enabled());
+            self.refresh_menu();
+        }
+
+        #[unsafe(method(updateAction:))]
+        fn update_action(&self, _sender: &NSMenuItem) {
+            self.on_update_clicked();
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             NSApplication::sharedApplication(self.mtm()).terminate(None);
@@ -151,6 +170,8 @@ impl AppDelegate {
                 sched: Scheduler::new(cfg, Now::now()),
                 test_mode,
                 overlays: Vec::new(),
+                updater: Updater::new(),
+                install_requested: false,
             }),
             screens_dirty: Cell::new(false),
             status_item: OnceCell::new(),
@@ -158,6 +179,8 @@ impl AppDelegate {
             pause_item: OnceCell::new(),
             interval_menu: OnceCell::new(),
             break_menu: OnceCell::new(),
+            login_item: OnceCell::new(),
+            update_item: OnceCell::new(),
             settings: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
@@ -209,6 +232,11 @@ impl AppDelegate {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.menu_item("설정…", Some(sel!(openSettings:)), 0));
         menu.addItem(&self.menu_item("설정 파일 열기…", Some(sel!(openConfig:)), 0));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let login_item = self.menu_item("로그인 시 자동 실행", Some(sel!(toggleLogin:)), 0);
+        menu.addItem(&login_item);
+        let update_item = self.menu_item("", Some(sel!(updateAction:)), 0);
+        menu.addItem(&update_item);
         menu.addItem(&self.menu_item("종료", Some(sel!(quit:)), 0));
         status_item.setMenu(Some(&menu));
         NSApplication::sharedApplication(mtm)
@@ -220,6 +248,8 @@ impl AppDelegate {
         let _ = iv.pause_item.set(pause);
         let _ = iv.interval_menu.set(interval_menu);
         let _ = iv.break_menu.set(break_menu);
+        let _ = iv.login_item.set(login_item);
+        let _ = iv.update_item.set(update_item);
         //#endregion
 
         //#region 0.5초 주기 타이머 (메뉴가 열려 있어도 돌도록 common mode 등록)
@@ -268,6 +298,9 @@ impl AppDelegate {
 
     //#region 매 틱 상태 진행
     fn on_tick(&self) {
+        if self.handle_update() {
+            return;
+        }
         let now = Now::now();
         let event = {
             let mut inner = self.ivars().inner.borrow_mut();
@@ -301,6 +334,59 @@ impl AppDelegate {
 
     fn is_breaking(&self) -> bool {
         self.ivars().inner.borrow().sched.is_breaking()
+    }
+    //#endregion
+
+    //#region 업데이트
+    fn on_update_clicked(&self) {
+        let mut inner = self.ivars().inner.borrow_mut();
+        if inner.sched.is_breaking() {
+            return;
+        }
+        if matches!(inner.updater.state(), upd::State::Available(_)) {
+            // 이 Mac 에서 자동 교체가 불가능하면 바로 릴리스 페이지 안내
+            if let Err(e) = update::app_bundle() {
+                log::write(&format!("자동 설치 불가: {e}"));
+                drop(inner);
+                open_url(upd::RELEASES_PAGE);
+                return;
+            }
+            inner.install_requested = true;
+            inner.updater.install(update::install);
+        } else {
+            inner.updater.check();
+        }
+    }
+
+    /// 자동 확인, 설치 완료 시 새 버전 실행 후 종료, 설치 실패 시 릴리스 페이지 안내. 종료를 시작했으면 true.
+    fn handle_update(&self) -> bool {
+        let (state, requested, breaking) = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            if !inner.test_mode {
+                inner.updater.tick();
+            }
+            let requested = std::mem::take(&mut inner.install_requested);
+            (inner.updater.state(), requested, inner.sched.is_breaking())
+        };
+        match state {
+            // 스트레칭 중에는 다시 시작하지 않고 끝날 때까지 기다림
+            upd::State::Ready(_) if !breaking => {
+                match update::app_bundle().and_then(|b| update::relaunch(&b)) {
+                    Ok(()) => log::write("새 버전을 실행하고 종료합니다"),
+                    Err(e) => {
+                        log::write(&e);
+                        open_url(upd::RELEASES_PAGE);
+                    }
+                }
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+                return true;
+            }
+            upd::State::Failed(_) if requested => open_url(upd::RELEASES_PAGE),
+            // 설치 진행 중이면 결과가 나올 때까지 플래그 유지
+            upd::State::Installing(_) if requested => self.ivars().inner.borrow_mut().install_requested = true,
+            _ => {}
+        }
+        false
     }
     //#endregion
 
@@ -485,11 +571,20 @@ impl AppDelegate {
     //#region 메뉴바 표시 갱신
     fn update_status_title(&self) {
         let iv = self.ivars();
-        let status = iv.inner.borrow().sched.status(Now::now());
+        let (status, upd_state) = {
+            let inner = iv.inner.borrow();
+            (inner.sched.status(Now::now()), inner.updater.state())
+        };
         if let Some(item) = iv.status_item.get() {
             if let Some(button) = item.button(self.mtm()) {
-                button.setTitle(&NSString::from_str(&status.title));
+                // 새 버전이 있으면 메뉴바에 작은 표시
+                let mark = if matches!(upd_state, upd::State::Available(_)) { " ⬆︎" } else { "" };
+                button.setTitle(&NSString::from_str(&format!("{}{mark}", status.title)));
             }
+        }
+        if let Some(u) = iv.update_item.get() {
+            u.setTitle(&NSString::from_str(&upd_state.menu_title()));
+            u.setEnabled(upd_state.clickable());
         }
         if let Some(info_item) = iv.info_item.get() {
             info_item.setTitle(&NSString::from_str(&status.info));
@@ -517,6 +612,9 @@ impl AppDelegate {
             if let Some(m) = iv.break_menu.get() {
                 mark(m, inner.sched.cfg.break_secs);
             }
+            if let Some(l) = iv.login_item.get() {
+                l.setState(if login::is_enabled() { NSControlStateValueOn } else { NSControlStateValueOff });
+            }
             if let Some(p) = iv.pause_item.get() {
                 let t = if inner.sched.is_paused() { "일시정지 해제" } else { "1시간 일시정지" };
                 p.setTitle(&NSString::from_str(t));
@@ -525,6 +623,12 @@ impl AppDelegate {
         self.update_status_title();
     }
     //#endregion
+}
+
+fn open_url(url: &str) {
+    if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
+        NSWorkspace::sharedWorkspace().openURL(&u);
+    }
 }
 
 //#region 진입점

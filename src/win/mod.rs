@@ -1,10 +1,11 @@
 //! Windows 구현: 작업 표시줄 트레이 상주 + Win32 전체 화면 가림 창
 mod overlay;
+pub mod update;
 
 use std::cell::RefCell;
 
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT,
+    COLORREF, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT,
     RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -20,7 +21,6 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -44,6 +44,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::common::config::{self, Config};
 use crate::common::schedule::{Event, Now, Scheduler, fmt_dur_label};
+use crate::common::update::{self as upd, Updater};
 use crate::common::{failsafe, log};
 
 //#region 상수 (메시지·메뉴 ID)
@@ -56,6 +57,7 @@ const ID_PAUSE: usize = 2;
 const ID_OPEN_CONFIG: usize = 3;
 const ID_OPEN_LOG: usize = 4;
 const ID_AUTOSTART: usize = 5;
+const ID_UPDATE: usize = 6;
 const ID_QUIT: usize = 9;
 /// 주기 메뉴: 10000 + 초
 const ID_INTERVAL_BASE: usize = 10_000;
@@ -77,6 +79,9 @@ struct App {
     overlays: Vec<HWND>,
     displays_dirty: bool,
     taskbar_created_msg: u32,
+    updater: Updater,
+    /// 사용자가 설치를 눌렀음 (실패하면 릴리스 페이지를 열어 수동 설치 안내)
+    install_requested: bool,
 }
 
 thread_local! {
@@ -256,9 +261,9 @@ fn append(menu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM
 
 fn show_menu(hwnd: HWND) {
     // 메뉴 표시 중(모달 루프)에는 APP 를 빌려두지 않도록 필요한 값만 복사
-    let Some((info, paused, interval, brk)) = with_app(|app| {
+    let Some((info, paused, interval, brk, upd_state)) = with_app(|app| {
         let st = app.sched.status(Now::now());
-        (st.info, app.sched.is_paused(), app.sched.cfg.interval_secs, app.sched.cfg.break_secs)
+        (st.info, app.sched.is_paused(), app.sched.cfg.interval_secs, app.sched.cfg.break_secs, app.updater.state())
     }) else {
         return;
     };
@@ -290,6 +295,8 @@ fn show_menu(hwnd: HWND) {
         append(menu, MF_SEPARATOR, 0, "");
         let auto_flags = if autostart_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
         append(menu, auto_flags, ID_AUTOSTART, "로그인 시 자동 실행");
+        let upd_flags = if upd_state.clickable() { MF_STRING } else { MF_STRING | MF_GRAYED };
+        append(menu, upd_flags, ID_UPDATE, &upd_state.menu_title());
         append(menu, MF_STRING, ID_OPEN_CONFIG, "설정 파일 열기…");
         append(menu, MF_STRING, ID_OPEN_LOG, "로그 파일 열기…");
         append(menu, MF_STRING, ID_QUIT, "종료");
@@ -301,6 +308,13 @@ fn show_menu(hwnd: HWND) {
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, None, hwnd, None);
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
+    }
+}
+
+fn open_url(url: &str) {
+    let u = HSTRING::from(url);
+    unsafe {
+        ShellExecuteW(None, w!("open"), &u, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
 }
 
@@ -319,6 +333,19 @@ fn on_command(id: usize) {
             with_app(|app| app.sched.toggle_pause(Now::now()));
         }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
+        ID_UPDATE => {
+            with_app(|app| {
+                if app.sched.is_breaking() {
+                    return;
+                }
+                if matches!(app.updater.state(), upd::State::Available(_)) {
+                    app.install_requested = true;
+                    app.updater.install(update::install);
+                } else {
+                    app.updater.check();
+                }
+            });
+        }
         ID_OPEN_CONFIG => {
             // 파일이 없으면 기본값으로 생성 후 열기
             if !config::config_path().exists() {
@@ -350,7 +377,46 @@ fn update_config(f: impl FnOnce(&mut Config)) {
 //#endregion
 
 //#region 매 틱 상태 진행
+/// 업데이트 진행: 자동 확인, 설치 완료 시 새 버전 실행 후 종료, 설치 실패 시 릴리스 페이지 안내.
+/// 종료를 시작했으면 true.
+fn handle_update() -> bool {
+    let Some((state, requested, breaking)) = with_app(|app| {
+        if !app.test_mode {
+            app.updater.tick();
+        }
+        (app.updater.state(), std::mem::take(&mut app.install_requested), app.sched.is_breaking())
+    }) else {
+        return false;
+    };
+    match state {
+        // 스트레칭 중에는 다시 시작하지 않고 끝날 때까지 기다림
+        upd::State::Ready(_) if !breaking => match update::relaunch() {
+            Ok(()) => {
+                log::write("새 버전을 실행하고 종료합니다");
+                unsafe { PostQuitMessage(0) };
+                return true;
+            }
+            Err(e) => {
+                log::write(&e);
+                open_url(upd::RELEASES_PAGE);
+                unsafe { PostQuitMessage(0) };
+                return true;
+            }
+        },
+        upd::State::Failed(_) if requested => open_url(upd::RELEASES_PAGE),
+        // 설치 진행 중이면 결과가 나올 때까지 플래그 유지
+        upd::State::Installing(_) if requested => {
+            with_app(|app| app.install_requested = true);
+        }
+        _ => {}
+    }
+    false
+}
+
 fn on_tick() {
+    if handle_update() {
+        return;
+    }
     let now = Now::now();
     let event = with_app(|app| {
         let ev = app.sched.tick(now, idle_secs());
@@ -414,7 +480,11 @@ fn refresh_tray() {
     with_app(|app| {
         let st = app.sched.status(Now::now());
         // 트레이는 글자를 못 띄우므로 툴팁에 남은 시간 표시 (이모지 제외)
-        tray_update(app.hwnd, &format!("Force Stretch · {}", st.info));
+        let extra = match app.updater.state() {
+            upd::State::Available(v) => format!(" · 새 버전 v{v}"),
+            _ => String::new(),
+        };
+        tray_update(app.hwnd, &format!("Force Stretch · {}{extra}", st.info));
     });
 }
 //#endregion
@@ -509,13 +579,8 @@ pub fn run(cfg: Config, test_mode: bool) {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         //#endregion
 
-        //#region 중복 실행 방지
-        let _mutex = CreateMutexW(None, true, w!("Local\\ForceStretchSingleton"));
-        if GetLastError() == ERROR_ALREADY_EXISTS && !test_mode {
-            log::write("이미 실행 중이므로 종료합니다");
-            return;
-        }
-        //#endregion
+        // 중복 실행 방지는 main.rs 의 파일 잠금이 담당
+        update::cleanup_old();
 
         //#region 숨은 메시지 창 + 트레이 + 타이머
         let hinstance = GetModuleHandleW(None).unwrap_or_default();
@@ -558,6 +623,8 @@ pub fn run(cfg: Config, test_mode: bool) {
                 overlays: Vec::new(),
                 displays_dirty: false,
                 taskbar_created_msg,
+                updater: Updater::new(),
+                install_requested: false,
             })
         });
 

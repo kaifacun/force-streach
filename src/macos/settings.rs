@@ -83,13 +83,13 @@ impl SettingsWindow {
 
         let idle_reset = unsafe {
             NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("5분 이상 자리를 비우면 주기를 처음부터 다시 시작"),
+                &NSString::from_str("5분 이상 자리를 비우면 주기 초기화"),
                 None,
                 None,
                 mtm,
             )
         };
-        idle_reset.setFrame(rect(20.0 + LABEL_W + 10.0 - 2.0, y, 270.0, ROW_H));
+        idle_reset.setFrame(rect(20.0 + LABEL_W + 8.0, y, W - (20.0 + LABEL_W + 8.0) - 12.0, ROW_H));
         idle_reset.setState(if cfg.idle_reset { NSControlStateValueOn } else { NSControlStateValueOff });
         view.addSubview(&idle_reset);
         //#endregion
