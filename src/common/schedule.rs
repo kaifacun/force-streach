@@ -2,7 +2,7 @@ use std::ops::{Add, AddAssign};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::config::Config;
-use super::tips::TIPS;
+use super::tips::{POSTURE_TIPS, PostureTip, TIPS};
 
 //#region 현재 시각 (벽시계 + 단조 시계)
 /// 벽시계(`wall`)는 시계 변경·동기화로 앞뒤로 뛸 수 있으므로
@@ -49,6 +49,8 @@ pub enum Event {
     StartBreak,
     /// 플랫폼은 가림을 걷고 `end_break` 를 호출해야 함
     EndBreak,
+    /// 플랫폼은 `posture_tip()` 을 2초간 전체 화면으로 띄워야 함 (입력·초점은 빼앗지 않음)
+    Nudge,
 }
 
 /// 메뉴바/트레이에 표시할 상태
@@ -68,6 +70,16 @@ pub struct BreakView {
 
 /// 잠자기 등으로 틱 간격이 이보다 길면 이미 쉰 것으로 간주
 const SLEEP_GAP_SECS: f64 = 30.0;
+
+/// 자세 귀띔 간격 (작업 누적 초, 이 범위에서 무작위)
+pub const NUDGE_GAP_MIN_SECS: f64 = 10.0 * 60.0;
+pub const NUDGE_GAP_MAX_SECS: f64 = 20.0 * 60.0;
+/// 자세 귀띔 표시 시간
+pub const NUDGE_SHOW: Duration = Duration::from_secs(2);
+/// 스트레칭 직전(경고 시간 + 이 여유) 에는 귀띔하지 않음
+const NUDGE_QUIET_BEFORE_BREAK_SECS: f64 = 60.0;
+/// 이 시간 이상 입력이 없으면 자리에 없다고 보고 귀띔을 미룸
+const NUDGE_ACTIVE_IDLE_SECS: f64 = 30.0;
 //#endregion
 
 //#region 시간 유틸
@@ -97,11 +109,58 @@ pub struct Scheduler {
     pub work_elapsed: f64,
     last_tick: Now,
     tip_offset: usize,
+    /// 작업 누적이 이 값에 이르면 자세 귀띔
+    next_nudge_at: f64,
+    nudge_idx: usize,
+    rng: u64,
 }
 
 impl Scheduler {
     pub fn new(cfg: Config, now: Now) -> Self {
-        Self { cfg, phase: Phase::Working, work_elapsed: 0.0, last_tick: now, tip_offset: 0 }
+        let seed = now
+            .wall
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        let mut s = Self {
+            cfg,
+            phase: Phase::Working,
+            work_elapsed: 0.0,
+            last_tick: now,
+            tip_offset: 0,
+            next_nudge_at: 0.0,
+            nudge_idx: 0,
+            rng: seed | 1,
+        };
+        s.nudge_idx = s.rand_below(POSTURE_TIPS.len());
+        s.reset_work();
+        s
+    }
+
+    //#region 자세 귀띔용 난수 (외부 crate 없이 xorshift)
+    fn rand_u64(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn rand_below(&mut self, n: usize) -> usize {
+        (self.rand_u64() % n.max(1) as u64) as usize
+    }
+
+    fn roll_nudge_gap(&mut self) -> f64 {
+        let t = (self.rand_u64() % 10_000) as f64 / 10_000.0;
+        NUDGE_GAP_MIN_SECS + (NUDGE_GAP_MAX_SECS - NUDGE_GAP_MIN_SECS) * t
+    }
+    //#endregion
+
+    /// 작업 누적을 처음부터 다시 셈 (다음 자세 귀띔 시점도 새로 뽑음)
+    fn reset_work(&mut self) {
+        self.work_elapsed = 0.0;
+        self.next_nudge_at = self.roll_nudge_gap();
     }
 
     /// 주기적으로 호출. `idle_secs` 는 마지막 키보드·마우스 입력 이후 경과 초.
@@ -114,7 +173,7 @@ impl Scheduler {
             Phase::Paused { until } => {
                 if now.wall >= until {
                     self.phase = Phase::Working;
-                    self.work_elapsed = 0.0;
+                    self.reset_work();
                 }
                 Event::None
             }
@@ -123,15 +182,20 @@ impl Scheduler {
                 // macOS 단조 시계는 잠자기 동안 멈추므로 벽시계 간격도 함께 봄
                 if dt.max(wall_dt) > SLEEP_GAP_SECS {
                     // 잠자기에서 깨어남
-                    self.work_elapsed = 0.0;
+                    self.reset_work();
                 } else if self.cfg.idle_reset && idle_secs >= idle_limit {
                     // 자리 비움
-                    self.work_elapsed = 0.0;
+                    self.reset_work();
                 } else {
                     self.work_elapsed += dt;
                 }
                 if self.work_elapsed >= self.cfg.interval_secs as f64 {
                     Event::StartBreak
+                } else if self.nudge_due(idle_secs) {
+                    self.nudge_idx = (self.nudge_idx + 1 + self.rand_below(POSTURE_TIPS.len() - 1))
+                        % POSTURE_TIPS.len();
+                    self.next_nudge_at = self.work_elapsed + self.roll_nudge_gap();
+                    Event::Nudge
                 } else {
                     Event::None
                 }
@@ -141,6 +205,22 @@ impl Scheduler {
             }
         }
     }
+
+    //#region 자세 귀띔
+    /// 켜져 있고, 시점이 됐고, 사용자가 자리에 있고, 스트레칭 직전이 아니면 귀띔
+    fn nudge_due(&self, idle_secs: f64) -> bool {
+        let left = self.cfg.interval_secs as f64 - self.work_elapsed;
+        self.cfg.posture_nudge
+            && self.work_elapsed >= self.next_nudge_at
+            && idle_secs < NUDGE_ACTIVE_IDLE_SECS
+            && left > self.cfg.warn_secs as f64 + NUDGE_QUIET_BEFORE_BREAK_SECS
+    }
+
+    /// 마지막 `Event::Nudge` 때 고른 자세 문구
+    pub fn posture_tip(&self) -> &'static PostureTip {
+        &POSTURE_TIPS[self.nudge_idx % POSTURE_TIPS.len()]
+    }
+    //#endregion
 
     pub fn is_breaking(&self) -> bool {
         matches!(self.phase, Phase::Breaking { .. })
@@ -165,14 +245,14 @@ impl Scheduler {
 
     pub fn end_break(&mut self) {
         self.phase = Phase::Working;
-        self.work_elapsed = 0.0;
+        self.reset_work();
     }
 
     /// 일시정지(1시간) ↔ 재개
     pub fn toggle_pause(&mut self, now: Now) {
         self.phase = match self.phase {
             Phase::Paused { .. } => {
-                self.work_elapsed = 0.0;
+                self.reset_work();
                 Phase::Working
             }
             Phase::Breaking { .. } => return,
@@ -182,10 +262,11 @@ impl Scheduler {
 
     /// 설정 교체. 주기가 바뀌면 처음부터 다시 셈.
     pub fn set_config(&mut self, cfg: Config) {
-        if cfg.interval_secs != self.cfg.interval_secs {
-            self.work_elapsed = 0.0;
-        }
+        let reset = cfg.interval_secs != self.cfg.interval_secs;
         self.cfg = cfg;
+        if reset {
+            self.reset_work();
+        }
     }
 
     pub fn status(&self, now: Now) -> Status {
@@ -236,7 +317,80 @@ mod tests {
             idle_reset: true,
             idle_reset_secs: 300,
             emergency_phrase: "x".into(),
+            posture_nudge: true,
         }
+    }
+
+    /// 긴 주기 설정 (자세 귀띔 시험용)
+    fn long_cfg() -> Config {
+        Config { interval_secs: 3600, warn_secs: 30, ..cfg() }
+    }
+
+    /// 1초 간격으로 n번 틱하며 귀띔 시점(작업 누적 초) 기록
+    fn nudge_times(s: &mut Scheduler, n: u64, idle: f64) -> Vec<f64> {
+        let mut now = t0();
+        let mut out = Vec::new();
+        for _ in 0..n {
+            now += Duration::from_secs(1);
+            match s.tick(now, idle) {
+                Event::Nudge => out.push(s.work_elapsed),
+                Event::StartBreak => break,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nudge_gaps_within_bounds() {
+        let mut s = Scheduler::new(long_cfg(), t0());
+        let times = nudge_times(&mut s, 3600, 0.0);
+        assert!(times.len() >= 2, "1시간에 두 번 이상: {times:?}");
+        let mut prev = 0.0;
+        for t in &times {
+            let gap = t - prev;
+            assert!((NUDGE_GAP_MIN_SECS - 1.0..=NUDGE_GAP_MAX_SECS + 1.0).contains(&gap), "gap {gap}");
+            prev = *t;
+        }
+        // 스트레칭 직전(경고 30초 + 60초)에는 귀띔 없음
+        assert!(times.iter().all(|t| *t < 3600.0 - 90.0));
+    }
+
+    #[test]
+    fn nudge_disabled() {
+        let mut c = long_cfg();
+        c.posture_nudge = false;
+        let mut s = Scheduler::new(c, t0());
+        assert!(nudge_times(&mut s, 3600, 0.0).is_empty());
+    }
+
+    #[test]
+    fn nudge_waits_while_away() {
+        // 입력이 없으면(자리 비움 초기화 기준 미만이라도) 귀띔하지 않음
+        let mut c = long_cfg();
+        c.idle_reset = false;
+        let mut s = Scheduler::new(c, t0());
+        assert!(nudge_times(&mut s, 3600, 60.0).is_empty());
+    }
+
+    #[test]
+    fn nudge_never_while_paused_or_breaking() {
+        let mut s = Scheduler::new(long_cfg(), t0());
+        s.toggle_pause(t0());
+        assert!(nudge_times(&mut s, 3000, 0.0).is_empty());
+        let mut s = Scheduler::new(long_cfg(), t0());
+        s.work_elapsed = 1500.0;
+        s.start_break(t0());
+        assert!(nudge_times(&mut s, 50, 0.0).is_empty());
+    }
+
+    #[test]
+    fn nudge_tip_changes() {
+        let mut s = Scheduler::new(long_cfg(), t0());
+        let before = s.posture_tip().title;
+        s.work_elapsed = s.next_nudge_at;
+        assert_eq!(s.tick(t0() + Duration::from_millis(500), 0.0), Event::Nudge);
+        assert_ne!(s.posture_tip().title, before);
     }
 
     fn t0() -> Now {

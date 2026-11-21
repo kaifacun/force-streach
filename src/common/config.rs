@@ -17,6 +17,8 @@ pub struct Config {
     pub idle_reset_secs: u64,
     /// 비상 해제 문구. 화면 가림 중 이 문구를 정확히 타이핑하면 해제된다. 빈 문자열이면 비활성.
     pub emergency_phrase: String,
+    /// 작업 중 가끔(10~20분 간격, 무작위) 앉은 자세를 2초간 전체 화면으로 귀띔할지 여부
+    pub posture_nudge: bool,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             idle_reset: true,
             idle_reset_secs: 300,
             emergency_phrase: "i promise i will stretch later".to_string(),
+            posture_nudge: true,
         }
     }
 }

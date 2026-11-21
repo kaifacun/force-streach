@@ -9,6 +9,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::common::phrase::PhraseBuffer;
+use crate::common::tips::PostureTip;
 
 //#region CoreGraphics FFI (최상위 창 레벨)
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -213,6 +214,96 @@ pub fn build_all(mtm: MainThreadMarker) -> Vec<Overlay> {
     NSScreen::screens(mtm)
         .iter()
         .map(|screen| Overlay::new(&screen, mtm))
+        .collect()
+}
+//#endregion
+
+//#region 자세 귀띔 창 (2초 표시, 초점·키 입력·마우스를 빼앗지 않음)
+pub struct Nudge {
+    window: Retained<NSWindow>,
+}
+
+impl Nudge {
+    fn new(screen: &NSScreen, tip: &PostureTip, mtm: MainThreadMarker) -> Self {
+        let frame = screen.frame();
+        // 일반 NSWindow(테두리 없음)는 키 창이 될 수 없으므로 작업 중인 앱의 초점이 유지됨
+        let window: Retained<NSWindow> = unsafe {
+            msg_send![NSWindow::alloc(mtm),
+                initWithContentRect: frame,
+                styleMask: NSWindowStyleMask::Borderless,
+                backing: NSBackingStoreType::Buffered,
+                defer: false]
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setLevel(unsafe { CGShieldingWindowLevel() } as isize);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        window.setIgnoresMouseEvents(true);
+        window.setOpaque(false);
+        window.setHasShadow(false);
+        window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+            0.08, 0.09, 0.13, 0.94,
+        )));
+        window.setFrame_display(frame, true);
+
+        //#region 라벨 배치: 큰 아이콘 · 제목 · 한 줄 설명
+        let w = frame.size.width;
+        let h = frame.size.height;
+        let white = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0);
+        let accent = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 0.42, 0.35, 1.0);
+        let pad = 40.0;
+        let rect = |y: f64, height: f64| {
+            NSRect::new(NSPoint::new(pad, y), NSSize::new(w - pad * 2.0, height))
+        };
+        let icon = make_label(
+            tip.icon,
+            &NSFont::systemFontOfSize((h * 0.16).clamp(72.0, 200.0)),
+            &white,
+            rect(h * 0.52, h * 0.22),
+            mtm,
+        );
+        let title = make_label(
+            tip.title,
+            &NSFont::boldSystemFontOfSize((h * 0.075).clamp(40.0, 96.0)),
+            &accent,
+            rect(h * 0.38, h * 0.12),
+            mtm,
+        );
+        let detail = make_label(
+            tip.detail,
+            &NSFont::systemFontOfSize((h * 0.038).clamp(22.0, 48.0)),
+            &white,
+            rect(h * 0.28, h * 0.08),
+            mtm,
+        );
+        let view = window.contentView().expect("content view");
+        view.addSubview(&icon);
+        view.addSubview(&title);
+        view.addSubview(&detail);
+        //#endregion
+
+        Self { window }
+    }
+
+    pub fn close(&self) {
+        self.window.orderOut(None);
+        self.window.close();
+    }
+}
+
+/// 모든 화면에 귀띔 창을 띄움 (앱 활성화·키 창 지정 없이 맨 앞에만 표시)
+pub fn show_nudges(tip: &PostureTip, mtm: MainThreadMarker) -> Vec<Nudge> {
+    NSScreen::screens(mtm)
+        .iter()
+        .map(|screen| {
+            let n = Nudge::new(&screen, tip, mtm);
+            n.window.orderFrontRegardless();
+            n
+        })
         .collect()
 }
 //#endregion

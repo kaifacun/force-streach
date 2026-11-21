@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+### 추가
+- 자세 귀띔: 작업 중 10~20분에 한 번(무작위) 거북목·허리·어깨 등 앉은 자세 안내를 2초간 전체 화면으로 표시. 초점·키 입력·마우스를 빼앗지 않으며, 자리 비움 중이거나 스트레칭 직전에는 건너뜀 (macOS, Windows)
+- 메뉴 "자세 귀띔 (가끔 2초)" 켜고 끄기, 설정 파일 `posture_nudge`
+- 명령줄 `--test-nudge`: 자세 귀띔을 한 번 띄우고 종료
+
 ## [0.2.0] - 2026-11-19
 
 ### 추가
@@ -31,6 +38,7 @@
 - macOS: 모니터 3대, 전체화면 앱, 비상 해제 실사용 확인
 - Windows 11 (VMware, ARM64에서 x64 에뮬레이션): 가림 화면·작업 표시줄 가림, 주기·스트레칭 시간 정확도 확인
 
-[Unreleased]: https://github.com/kaifacun/force-streach/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kaifacun/force-streach/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kaifacun/force-streach/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kaifacun/force-streach/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kaifacun/force-streach/releases/tag/v0.1.0

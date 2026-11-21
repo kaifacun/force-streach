@@ -19,6 +19,7 @@
   - macOS: 전체화면 앱·다른 데스크탑(Spaces) 위까지 덮고, Dock·메뉴바 숨김, `Cmd+Tab` 앱 전환 차단, `Cmd+Q` 등 단축키 무시
   - Windows: 저수준 키보드 훅으로 `Alt+Tab`, `Win` 키, `Alt+F4` 등 모든 키 입력 차단
   - 큰 카운트다운과 스트레칭 동작 안내(20초마다 교체)
+- **자세 귀띔** — 작업 중 10~20분에 한 번(무작위) 거북목·허리·어깨 같은 앉은 자세 안내를 2초간 전체 화면으로 띄웠다가 사라짐. 키 입력·마우스·초점은 그대로라 타이핑이 끊기지 않으며, 자리를 비웠거나 스트레칭 직전이면 건너뜀. 메뉴에서 끌 수 있음
 - **사전 경고** — 시작 30초 전부터 macOS 메뉴바 아이콘이 `⚠️`로 바뀜
 - **똑똑한 주기 계산**
   - 5분 이상(또는 스트레칭 시간 이상) 입력이 없으면 이미 쉰 것으로 보고 주기를 초기화
@@ -75,6 +76,7 @@ cd force-streach
 | 1시간 일시정지 / 일시정지 해제 | 회의·발표 중에 사용 |
 | 스트레칭 주기 | 20 / 30 / 45 / 50 / 60 / 90분마다 |
 | 스트레칭 시간 | 1 / 2 / 3 / 5 / 10분 |
+| 자세 귀띔 (가끔 2초) | 체크하면 작업 중 가끔 앉은 자세 안내를 2초간 표시 |
 | 설정… | 주기·시간 직접 입력, 경고 시간, 자리 비움 초기화, 비상 해제 문구 |
 | 설정 파일 열기… | `config.toml`을 기본 편집기로 열기 |
 | 로그인 시 자동 실행 | 체크하면 `~/Library/LaunchAgents/local.force-stretch.plist` 작성 (다음 로그인부터 적용), 해제하면 삭제 |
@@ -87,6 +89,7 @@ cd force-streach
 
 ```sh
 open -n -W "target/Force Stretch.app" --args --test
+open -n -W "target/Force Stretch.app" --args --test-nudge   # 자세 귀띔 한 번 띄우고 종료
 ```
 
 ## Windows (베타)
@@ -114,7 +117,7 @@ open -n -W "target/Force Stretch.app" --args --test
 | 다음 스트레칭까지 MM:SS | 현재 상태 표시 (아이콘에 마우스를 올려도 표시) |
 | 지금 스트레칭 시작 | 즉시 화면 가림 시작 |
 | 1시간 일시정지 / 일시정지 해제 | 회의·발표 중에 사용 |
-| 스트레칭 주기 / 스트레칭 시간 | macOS와 동일 |
+| 스트레칭 주기 / 스트레칭 시간 / 자세 귀띔 | macOS와 동일 |
 | 로그인 시 자동 실행 | 체크하면 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`에 등록 |
 | 업데이트 확인 / 새 버전 vX.Y.Z 설치 | 새 버전이 있으면 툴팁에도 표시. 누르면 설치 후 다시 실행 |
 | 설정 파일 열기… | 메모장으로 `config.toml` 열기 (저장 후 앱을 다시 실행해야 반영) |
@@ -125,9 +128,10 @@ open -n -W "target/Force Stretch.app" --args --test
 
 ```powershell
 .\force-stretch.exe --test
+.\force-stretch.exe --test-nudge   # 자세 귀띔 한 번 띄우고 종료
 ```
 
-5초 뒤 약 8초간 모든 모니터를 가리고, 끝나면 자동 종료됩니다.
+`--test`는 5초 뒤 약 8초간 모든 모니터를 가리고, 끝나면 자동 종료됩니다.
 
 ### Windows 시험 체크리스트
 
@@ -167,6 +171,7 @@ warn_secs = 30            # 시작 전 메뉴바 경고 시간 (초)
 idle_reset = true         # 자리 비움 시 주기 초기화 여부
 idle_reset_secs = 300     # 자리 비움으로 판단할 무입력 시간 (초)
 emergency_phrase = "i promise i will stretch later"  # 비상 해제 문구. ""이면 비활성
+posture_nudge = true      # 작업 중 가끔(10~20분) 앉은 자세를 2초간 귀띔
 ```
 
 설정 파일을 직접 고친 경우 앱을 다시 실행해야 반영됩니다. 메뉴나 설정 창에서 바꾼 값은 즉시 반영되고 자동 저장됩니다.
@@ -186,14 +191,14 @@ src/
 │   ├── phrase.rs      # 비상 해제 문구 입력 버퍼 + 단위 테스트
 │   ├── failsafe.rs    # UI와 독립된 감시 스레드
 │   ├── log.rs         # stderr + 파일 로그
-│   └── tips.rs        # 스트레칭 동작 안내 문구
+│   └── tips.rs        # 스트레칭 동작 안내, 자세 귀띔 문구
 ├── macos/             # AppKit (objc2)
 │   ├── mod.rs         # 메뉴바, 타이머, 키오스크 옵션
-│   ├── overlay.rs     # 모니터별 가림 창, 키 입력
+│   ├── overlay.rs     # 모니터별 가림 창, 키 입력, 자세 귀띔 창
 │   └── settings.rs    # 설정 창
 └── win/               # Win32 (windows-rs)
     ├── mod.rs         # 트레이, 메뉴, 타이머, 자동 실행, 중복 실행 방지
-    └── overlay.rs     # 모니터별 가림 창(GDI), 저수준 키보드 훅
+    └── overlay.rs     # 모니터별 가림 창(GDI), 저수준 키보드 훅, 자세 귀띔 창
 ```
 
 ```sh

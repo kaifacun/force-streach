@@ -21,12 +21,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, SetWindowsHookExW,
     ShowWindow, SW_SHOWNA, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_CLOSE, WM_ERASEBKGND,
     WM_KEYDOWN, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::common::phrase::PhraseBuffer;
+use crate::common::tips::PostureTip;
 
 const CLASS_NAME: PCWSTR = w!("ForceStretchOverlay");
+const NUDGE_CLASS: PCWSTR = w!("ForceStretchNudge");
 
 //#region 화면에 그릴 내용 (WM_PAINT 에서 읽음, 앱 상태와 분리해 재진입 방지)
 #[derive(Default, Clone)]
@@ -40,6 +43,7 @@ thread_local! {
     static PAINT: RefCell<PaintText> = RefCell::new(PaintText::default());
     static TYPED: RefCell<PhraseBuffer> = const { RefCell::new(PhraseBuffer::new()) };
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+    static NUDGE: RefCell<Option<&'static PostureTip>> = const { RefCell::new(None) };
 }
 
 pub fn set_paint_text(t: PaintText) {
@@ -133,6 +137,8 @@ pub fn register_class() {
         ..Default::default()
     };
     unsafe { RegisterClassW(&wc) };
+    let nudge = WNDCLASSW { lpfnWndProc: Some(nudge_proc), lpszClassName: NUDGE_CLASS, ..wc };
+    unsafe { RegisterClassW(&nudge) };
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -140,6 +146,10 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 }
 
 fn font(height: i32, bold: bool) -> HFONT {
+    font_face(height, bold, w!("Malgun Gothic"))
+}
+
+fn font_face(height: i32, bold: bool, face: PCWSTR) -> HFONT {
     unsafe {
         CreateFontW(
             -height,
@@ -155,13 +165,16 @@ fn font(height: i32, bold: bool) -> HFONT {
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             FF_DONTCARE.0 as u32,
-            w!("Malgun Gothic"),
+            face,
         )
     }
 }
 
 fn draw_text(hdc: HDC, text: &str, rect: RECT, height: i32, bold: bool, color: COLORREF, wrap: bool) {
-    let f = font(height, bold);
+    draw_text_font(hdc, text, rect, font(height, bold), color, wrap);
+}
+
+fn draw_text_font(hdc: HDC, text: &str, rect: RECT, f: HFONT, color: COLORREF, wrap: bool) {
     unsafe {
         let old = SelectObject(hdc, HGDIOBJ(f.0));
         SetTextColor(hdc, color);
@@ -176,16 +189,14 @@ fn draw_text(hdc: HDC, text: &str, rect: RECT, height: i32, bold: bool, color: C
     }
 }
 
-fn paint(hwnd: HWND) {
-    let text = PAINT.with(|p| p.borrow().clone());
+/// 메모리 DC 에 그린 뒤 한 번에 복사 (깜빡임 방지). `draw(mem, w, h)` 가 배경 위에 내용을 그림.
+fn paint_buffered(hwnd: HWND, draw: impl FnOnce(HDC, i32, i32)) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-
-        //#region 깜빡임 방지용 메모리 DC 에 그린 뒤 한 번에 복사
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         let old_bmp = SelectObject(mem, HGDIOBJ(bmp.0));
@@ -194,7 +205,19 @@ fn paint(hwnd: HWND) {
         FillRect(mem, &rc, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
         SetBkMode(mem, TRANSPARENT);
+        draw(mem, w, h);
 
+        let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn paint(hwnd: HWND) {
+    let text = PAINT.with(|p| p.borrow().clone());
+    paint_buffered(hwnd, |mem, w, h| {
         let pad = 40;
         let band = |top: f64, height: f64| RECT {
             left: pad,
@@ -211,15 +234,7 @@ fn paint(hwnd: HWND) {
             (hf * 0.032).clamp(20.0, 40.0) as i32, false, rgb(255, 255, 255), true);
         draw_text(mem, &text.footer, RECT { left: pad, right: w - pad, top: h - 64, bottom: h - 24 },
             14, false, rgb(140, 140, 150), false);
-
-        let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-        SelectObject(mem, old_bmp);
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem);
-        //#endregion
-
-        let _ = EndPaint(hwnd, &ps);
-    }
+    });
 }
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -234,6 +249,70 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_CLOSE => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+//#endregion
+
+//#region 자세 귀띔 창 (2초 표시, 초점·키 입력·마우스를 빼앗지 않음)
+fn paint_nudge(hwnd: HWND) {
+    let Some(tip) = NUDGE.with(|n| *n.borrow()) else { return };
+    paint_buffered(hwnd, |mem, w, h| {
+        let pad = 40;
+        let hf = h as f64;
+        let band = |top: f64, height: f64| RECT {
+            left: pad,
+            right: w - pad,
+            top: (hf * top) as i32,
+            bottom: (hf * (top + height)) as i32,
+        };
+        // GDI 는 컬러 이모지를 못 그리므로 Segoe UI Emoji 단색 글리프로 표시
+        let icon_font = font_face((hf * 0.14).clamp(64.0, 180.0) as i32, false, w!("Segoe UI Emoji"));
+        draw_text_font(mem, tip.icon, band(0.22, 0.24), icon_font, rgb(255, 255, 255), false);
+        draw_text(mem, tip.title, band(0.48, 0.12),
+            (hf * 0.075).clamp(40.0, 96.0) as i32, true, rgb(255, 107, 89), false);
+        draw_text(mem, tip.detail, band(0.61, 0.08),
+            (hf * 0.038).clamp(22.0, 48.0) as i32, false, rgb(255, 255, 255), false);
+    });
+}
+
+unsafe extern "system" fn nudge_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_nudge(hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// 모든 모니터에 반투명 귀띔 창 표시. 클릭은 아래 창으로 통과하고, 활성화하지 않음.
+pub fn show_nudges(tip: &'static PostureTip) -> Vec<HWND> {
+    NUDGE.with(|n| *n.borrow_mut() = Some(tip));
+    let hinstance = unsafe { GetModuleHandleW(None) }.ok();
+    monitor_rects()
+        .into_iter()
+        .filter_map(|r| unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                NUDGE_CLASS,
+                w!("Force Stretch"),
+                WS_POPUP,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                None,
+                None,
+                hinstance.map(|h| h.into()),
+                None,
+            )
+            .ok()
+        })
+        .inspect(|&hwnd| unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 240, LWA_ALPHA);
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        })
+        .collect()
 }
 //#endregion
 

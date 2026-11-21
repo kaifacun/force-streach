@@ -6,6 +6,7 @@ pub mod update;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::panic::AssertUnwindSafe;
+use std::time::Instant;
 use crate::common::schedule::Now;
 
 use objc2::rc::Retained;
@@ -23,7 +24,7 @@ use objc2_foundation::{
 };
 
 use crate::common::config::{self, Config};
-use crate::common::schedule::{Event, Scheduler, fmt_dur_label};
+use crate::common::schedule::{Event, NUDGE_SHOW, Scheduler, fmt_dur_label};
 use crate::common::update::{self as upd, Updater};
 use crate::common::{failsafe, log};
 use overlay::Overlay;
@@ -47,6 +48,11 @@ struct Inner {
     sched: Scheduler,
     test_mode: bool,
     overlays: Vec<Overlay>,
+    /// 자세 귀띔 창과 닫을 시각
+    nudges: Vec<overlay::Nudge>,
+    nudge_until: Option<Instant>,
+    /// `--test-nudge`: 귀띔 한 번 띄우고 종료
+    nudge_demo: bool,
     updater: Updater,
     /// 사용자가 설치를 눌렀음 (실패하면 릴리스 페이지를 열어 수동 설치 안내)
     install_requested: bool,
@@ -62,6 +68,7 @@ struct Ivars {
     interval_menu: OnceCell<Retained<NSMenu>>,
     break_menu: OnceCell<Retained<NSMenu>>,
     login_item: OnceCell<Retained<NSMenuItem>>,
+    posture_item: OnceCell<Retained<NSMenuItem>>,
     update_item: OnceCell<Retained<NSMenuItem>>,
     settings: RefCell<Option<SettingsWindow>>,
 }
@@ -150,6 +157,14 @@ define_class!(
             self.refresh_menu();
         }
 
+        #[unsafe(method(togglePosture:))]
+        fn toggle_posture(&self, _sender: &NSMenuItem) {
+            self.update_config(|c| c.posture_nudge = !c.posture_nudge);
+            if !self.ivars().inner.borrow().sched.cfg.posture_nudge {
+                self.hide_nudges();
+            }
+        }
+
         #[unsafe(method(updateAction:))]
         fn update_action(&self, _sender: &NSMenuItem) {
             self.on_update_clicked();
@@ -164,12 +179,15 @@ define_class!(
 );
 
 impl AppDelegate {
-    fn new(mtm: MainThreadMarker, cfg: Config, test_mode: bool) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, cfg: Config, test_mode: bool, nudge_demo: bool) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(Inner {
                 sched: Scheduler::new(cfg, Now::now()),
                 test_mode,
                 overlays: Vec::new(),
+                nudges: Vec::new(),
+                nudge_until: None,
+                nudge_demo,
                 updater: Updater::new(),
                 install_requested: false,
             }),
@@ -180,6 +198,7 @@ impl AppDelegate {
             interval_menu: OnceCell::new(),
             break_menu: OnceCell::new(),
             login_item: OnceCell::new(),
+            posture_item: OnceCell::new(),
             update_item: OnceCell::new(),
             settings: RefCell::new(None),
         });
@@ -228,6 +247,8 @@ impl AppDelegate {
         let break_root = self.menu_item("스트레칭 시간", None, 0);
         break_root.setSubmenu(Some(&break_menu));
         menu.addItem(&break_root);
+        let posture_item = self.menu_item("자세 귀띔 (가끔 2초)", Some(sel!(togglePosture:)), 0);
+        menu.addItem(&posture_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.menu_item("설정…", Some(sel!(openSettings:)), 0));
@@ -249,6 +270,7 @@ impl AppDelegate {
         let _ = iv.interval_menu.set(interval_menu);
         let _ = iv.break_menu.set(break_menu);
         let _ = iv.login_item.set(login_item);
+        let _ = iv.posture_item.set(posture_item);
         let _ = iv.update_item.set(update_item);
         //#endregion
 
@@ -277,6 +299,9 @@ impl AppDelegate {
         //#endregion
 
         self.refresh_menu();
+        if self.ivars().inner.borrow().nudge_demo {
+            self.show_nudge();
+        }
     }
 
     fn menu_item(&self, title: &str, action: Option<Sel>, tag: isize) -> Retained<NSMenuItem> {
@@ -302,6 +327,15 @@ impl AppDelegate {
             return;
         }
         let now = Now::now();
+        let expired = self.ivars().inner.borrow().nudge_until.is_some_and(|t| now.mono >= t);
+        if expired {
+            self.hide_nudges();
+            if self.ivars().inner.borrow().nudge_demo {
+                log::write("시험 모드: 자세 귀띔 1회 완료, 종료합니다");
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+                return;
+            }
+        }
         let event = {
             let mut inner = self.ivars().inner.borrow_mut();
             let ev = inner.sched.tick(now, idle_secs());
@@ -316,6 +350,7 @@ impl AppDelegate {
         match event {
             Event::StartBreak => self.start_break(),
             Event::EndBreak => self.end_break(),
+            Event::Nudge => self.show_nudge(),
             Event::None => {
                 if self.is_breaking() {
                     if self.ivars().screens_dirty.replace(false) {
@@ -390,11 +425,32 @@ impl AppDelegate {
     }
     //#endregion
 
+    //#region 자세 귀띔 표시/숨김
+    fn show_nudge(&self) {
+        self.hide_nudges();
+        let mtm = self.mtm();
+        let mut inner = self.ivars().inner.borrow_mut();
+        let tip = inner.sched.posture_tip();
+        inner.nudges = overlay::show_nudges(tip, mtm);
+        inner.nudge_until = Some(Instant::now() + NUDGE_SHOW);
+        log::write(&format!("자세 귀띔: {}", tip.title));
+    }
+
+    fn hide_nudges(&self) {
+        let mut inner = self.ivars().inner.borrow_mut();
+        inner.nudge_until = None;
+        for n in inner.nudges.drain(..) {
+            n.close();
+        }
+    }
+    //#endregion
+
     //#region 스트레칭 시작/종료
     fn start_break(&self) {
         if self.is_breaking() {
             return;
         }
+        self.hide_nudges();
         let mtm = self.mtm();
         let now = Now::now();
         let ends_at = self.ivars().inner.borrow_mut().sched.start_break(now);
@@ -612,6 +668,9 @@ impl AppDelegate {
             if let Some(m) = iv.break_menu.get() {
                 mark(m, inner.sched.cfg.break_secs);
             }
+            if let Some(p) = iv.posture_item.get() {
+                p.setState(if inner.sched.cfg.posture_nudge { NSControlStateValueOn } else { NSControlStateValueOff });
+            }
             if let Some(l) = iv.login_item.get() {
                 l.setState(if login::is_enabled() { NSControlStateValueOn } else { NSControlStateValueOff });
             }
@@ -632,11 +691,11 @@ fn open_url(url: &str) {
 }
 
 //#region 진입점
-pub fn run(cfg: Config, test_mode: bool) {
+pub fn run(cfg: Config, test_mode: bool, nudge_demo: bool) {
     let mtm = MainThreadMarker::new().expect("메인 스레드에서 실행해야 합니다");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    let delegate = AppDelegate::new(mtm, cfg, test_mode);
+    let delegate = AppDelegate::new(mtm, cfg, test_mode, nudge_demo);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     app.run();
 }

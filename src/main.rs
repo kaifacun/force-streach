@@ -17,8 +17,11 @@ fn main() {
         #[cfg(windows)]
         std::process::exit(common::update::run_cli(win::update::install, win::update::relaunch));
     }
-    let test_mode = std::env::args().any(|a| a == "--test");
-    let cfg = if test_mode {
+    // --test-nudge: 자세 귀띔을 한 번 띄우고 종료 (설정 저장·업데이트 확인·중복 실행 검사 없음)
+    let nudge_demo = std::env::args().any(|a| a == "--test-nudge");
+    let break_test = std::env::args().any(|a| a == "--test");
+    let test_mode = break_test || nudge_demo;
+    let cfg = if break_test {
         common::config::Config::test_mode()
     } else {
         common::config::Config::load()
@@ -38,12 +41,12 @@ fn main() {
     common::failsafe::spawn();
 
     #[cfg(target_os = "macos")]
-    macos::run(cfg, test_mode);
+    macos::run(cfg, test_mode, nudge_demo);
     #[cfg(windows)]
-    win::run(cfg, test_mode);
+    win::run(cfg, test_mode, nudge_demo);
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let _ = (cfg, test_mode);
+        let _ = (cfg, test_mode, nudge_demo);
         eprintln!("지원하지 않는 운영체제입니다 (macOS / Windows 전용)");
     }
 }

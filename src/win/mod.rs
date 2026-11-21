@@ -3,6 +3,7 @@ mod overlay;
 pub mod update;
 
 use std::cell::RefCell;
+use std::time::Instant;
 
 use windows::Win32::Foundation::{
     COLORREF, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT,
@@ -43,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::common::config::{self, Config};
-use crate::common::schedule::{Event, Now, Scheduler, fmt_dur_label};
+use crate::common::schedule::{Event, NUDGE_SHOW, Now, Scheduler, fmt_dur_label};
 use crate::common::update::{self as upd, Updater};
 use crate::common::{failsafe, log};
 
@@ -58,6 +59,7 @@ const ID_OPEN_CONFIG: usize = 3;
 const ID_OPEN_LOG: usize = 4;
 const ID_AUTOSTART: usize = 5;
 const ID_UPDATE: usize = 6;
+const ID_POSTURE: usize = 7;
 const ID_QUIT: usize = 9;
 /// 주기 메뉴: 10000 + 초
 const ID_INTERVAL_BASE: usize = 10_000;
@@ -77,6 +79,11 @@ struct App {
     sched: Scheduler,
     test_mode: bool,
     overlays: Vec<HWND>,
+    /// 자세 귀띔 창과 닫을 시각
+    nudges: Vec<HWND>,
+    nudge_until: Option<Instant>,
+    /// `--test-nudge`: 귀띔 한 번 띄우고 종료
+    nudge_demo: bool,
     displays_dirty: bool,
     taskbar_created_msg: u32,
     updater: Updater,
@@ -261,9 +268,10 @@ fn append(menu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM
 
 fn show_menu(hwnd: HWND) {
     // 메뉴 표시 중(모달 루프)에는 APP 를 빌려두지 않도록 필요한 값만 복사
-    let Some((info, paused, interval, brk, upd_state)) = with_app(|app| {
+    let Some((info, paused, interval, brk, posture, upd_state)) = with_app(|app| {
         let st = app.sched.status(Now::now());
-        (st.info, app.sched.is_paused(), app.sched.cfg.interval_secs, app.sched.cfg.break_secs, app.updater.state())
+        let c = &app.sched.cfg;
+        (st.info, app.sched.is_paused(), c.interval_secs, c.break_secs, c.posture_nudge, app.updater.state())
     }) else {
         return;
     };
@@ -291,6 +299,8 @@ fn show_menu(hwnd: HWND) {
             }
             append(menu, MF_POPUP, sub.0 as usize, "스트레칭 시간");
         }
+        let posture_flags = if posture { MF_STRING | MF_CHECKED } else { MF_STRING };
+        append(menu, posture_flags, ID_POSTURE, "자세 귀띔 (가끔 2초)");
 
         append(menu, MF_SEPARATOR, 0, "");
         let auto_flags = if autostart_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
@@ -333,6 +343,14 @@ fn on_command(id: usize) {
             with_app(|app| app.sched.toggle_pause(Now::now()));
         }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
+        ID_POSTURE => {
+            update_config(|c| c.posture_nudge = !c.posture_nudge);
+            with_app(|app| {
+                if !app.sched.cfg.posture_nudge {
+                    hide_nudges(app);
+                }
+            });
+        }
         ID_UPDATE => {
             with_app(|app| {
                 if app.sched.is_breaking() {
@@ -418,6 +436,18 @@ fn on_tick() {
         return;
     }
     let now = Now::now();
+    let demo_done = with_app(|app| {
+        if app.nudge_until.is_some_and(|t| now.mono >= t) {
+            hide_nudges(app);
+            return app.nudge_demo;
+        }
+        false
+    });
+    if demo_done == Some(true) {
+        log::write("시험 모드: 자세 귀띔 1회 완료, 종료합니다");
+        unsafe { PostQuitMessage(0) };
+        return;
+    }
     let event = with_app(|app| {
         let ev = app.sched.tick(now, idle_secs());
         if app.sched.is_breaking() && overlay::typed_matches(&app.sched.cfg.emergency_phrase) {
@@ -431,6 +461,9 @@ fn on_tick() {
     match event {
         Some(Event::StartBreak) => start_break(),
         Some(Event::EndBreak) => end_break(),
+        Some(Event::Nudge) => {
+            with_app(show_nudge);
+        }
         Some(Event::None) => {
             with_app(|app| {
                 if !app.sched.is_breaking() {
@@ -489,6 +522,21 @@ fn refresh_tray() {
 }
 //#endregion
 
+//#region 자세 귀띔 표시/숨김
+fn show_nudge(app: &mut App) {
+    hide_nudges(app);
+    let tip = app.sched.posture_tip();
+    app.nudges = overlay::show_nudges(tip);
+    app.nudge_until = Some(Instant::now() + NUDGE_SHOW);
+    log::write(&format!("자세 귀띔: {} (창 {}개)", tip.title, app.nudges.len()));
+}
+
+fn hide_nudges(app: &mut App) {
+    app.nudge_until = None;
+    overlay::destroy_all(&mut app.nudges);
+}
+//#endregion
+
 //#region 스트레칭 시작/종료
 fn start_break() {
     let now = Now::now();
@@ -496,6 +544,7 @@ fn start_break() {
         if app.sched.is_breaking() {
             return;
         }
+        hide_nudges(app);
         let ends_at = app.sched.start_break(now);
         failsafe::arm(ends_at);
         overlay::clear_typed();
@@ -573,7 +622,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 //#endregion
 
 //#region 진입점
-pub fn run(cfg: Config, test_mode: bool) {
+pub fn run(cfg: Config, test_mode: bool, nudge_demo: bool) {
     unsafe {
         //#region 고해상도(모니터별 배율) 대응: 창 생성 전에 설정해야 배율 모니터도 전부 덮음
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -621,6 +670,9 @@ pub fn run(cfg: Config, test_mode: bool) {
                 sched: Scheduler::new(cfg, Now::now()),
                 test_mode,
                 overlays: Vec::new(),
+                nudges: Vec::new(),
+                nudge_until: None,
+                nudge_demo,
                 displays_dirty: false,
                 taskbar_created_msg,
                 updater: Updater::new(),
@@ -631,6 +683,9 @@ pub fn run(cfg: Config, test_mode: bool) {
         tray_add(hwnd);
         SetTimer(Some(hwnd), TIMER_ID, 500, None);
         log::write(&format!("시작 (test_mode={test_mode})"));
+        if nudge_demo {
+            with_app(show_nudge);
+        }
         //#endregion
 
         //#region 메시지 루프
@@ -644,6 +699,7 @@ pub fn run(cfg: Config, test_mode: bool) {
         //#region 정리
         with_app(|app| {
             overlay::destroy_all(&mut app.overlays);
+            overlay::destroy_all(&mut app.nudges);
         });
         overlay::remove_hook();
         tray_remove(hwnd);
